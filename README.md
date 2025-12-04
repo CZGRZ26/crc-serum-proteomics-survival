@@ -117,7 +117,7 @@ This project is designed as a **portfolio-grade biomedical data science project*
 
 ---
 
-## 🔬 Key Biological Findings
+##  Key Biological Findings
 
 Although no individual proteins passed FDR-adjusted thresholds, **pathway-level analysis revealed strong and highly significant enrichment** in:
 
