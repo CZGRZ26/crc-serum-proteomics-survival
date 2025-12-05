@@ -1,0 +1,254 @@
+---
+title: "Import build SE alive vs dead"
+author: "Thomas Norburn"
+date: "2025-12-05"
+output: html_document
+---
+
+```{r}
+
+
+```
+
+# 01_import_build_SE_alive_dead
+
+**Goal:**
+
+Take the messy protein export + metadata and turn it into a clean `SummarizedExperiment` with an **Alive vs Dead** label per sample.
+
+## Load libraries 
+
+```{r}
+
+library(tidyverse)
+library(readxl)
+library(SummarizedExperiment)
+```
+
+## Path
+
+Tell R **where your input data lives** and where to **save processed data**. Make sure the `processed` folder exists so later you can save `se` there.
+
+protein_file \<- "..."
+
+metadata_file \<- "..."
+
+out_dir \<- "..."
+
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+```{{r}}
+
+
+```
+
+```{r}
+# Adjust this if you're not running from the project root
+protein_file <- "C:\\Users\\tno\\Documents\\Coding\\Proteomics plasma analysis\\Data\\raw\\Identifications_proteins.csv"
+metadata_file <- "C:\\Users\\tno\\Documents\\Coding\\Proteomics plasma analysis\\Data\\raw\\Comparisions_metadata.xlsx"
+
+out_dir <- "C:\\Coding\\Proteomics plasma analysis\\Data\\processed"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+```
+
+## 1. Load raw protein table (no header)
+
+Identifications_proteins.csv has a multi-row header, so we first read it **with no header**. We’ll manually construct the proper column names later.
+
+```{r}
+
+prot_raw <- read.csv(
+  protein_file,
+  header = FALSE,
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+cat("prot_raw dimensions:", paste(dim(prot_raw), collapse = " x "), "\n")
+cat("First few rows / cols:\n")
+print(prot_raw[1:5, 1:10])
+```
+
+## 2. Use row 3 as header, row 4+ as data
+
+Row 3 contains the **real column names** (Accession, Peptide count, sample names, …)
+
+Row 4 onwards are the **actual protein measurements**.
+
+We assign row 3 as `colnames` and drop fully empty rows. Now we have a **clean protein table** with proper headers.
+
+```{r}
+header_row     <- 3
+data_start_row <- 4
+
+header <- as.character(prot_raw[header_row, ])
+
+prot_clean <- prot_raw[data_start_row:nrow(prot_raw), ]
+colnames(prot_clean) <- header
+
+# Drop completely empty rows (just in case)
+prot_clean <- prot_clean[rowSums(prot_clean != "" & !is.na(prot_clean)) > 0, ]
+
+cat("prot_clean dimensions:", paste(dim(prot_clean), collapse = " x "), "\n")
+cat("First 10 column names:\n")
+print(colnames(prot_clean)[1:10])
+
+```
+
+## 3. Define meta vs intensity columns
+
+The first 5 columns (1–5) are **protein metadata**: Accession, peptide counts, description.
+
+Columns 6 onwards are **sample-wise intensities** (one column per LC–MS run).
+
+We’ll treat metadata and numeric intensities separately.
+
+```{r}
+
+meta_cols_idx      <- 1:5
+intensity_cols_idx <- 6:ncol(prot_clean)
+
+cat("Meta columns:\n")
+print(colnames(prot_clean)[meta_cols_idx])
+
+cat("First 10 intensity columns:\n")
+print(colnames(prot_clean)[intensity_cols_idx][1:10])
+```
+
+## 4. Convert intensity columns to numeric and build expression matrix
+
+Convert all intensity columns from text → **numeric**.
+
+Build a **protein × sample matrix** (`expr_mat`) where:
+
+-   Rows = proteins (Accession IDs)
+
+-   Columns = samples (LC–MS files)
+
+This is the core quantitative data for the downstream analysis.
+
+```{r}
+
+prot_clean <- as.data.frame(prot_clean)
+
+prot_clean[intensity_cols_idx] <- lapply(
+  prot_clean[intensity_cols_idx],
+  function(x) as.numeric(as.character(x))
+)
+
+# Quick sanity check of classes
+cat("Classes of first few intensity columns:\n")
+print(sapply(prot_clean[intensity_cols_idx][1:5], class))
+
+# Build protein (rows) × sample (cols) matrix
+expr_mat <- as.matrix(prot_clean[, intensity_cols_idx])
+rownames(expr_mat) <- prot_clean$Accession
+
+cat("expr_mat dimensions:", paste(dim(expr_mat), collapse = " x "), "\n")
+cat("expr_mat[1:5, 1:5]:\n")
+print(expr_mat[1:5, 1:5])
+```
+
+## 5. Load metadata and align samples
+
+Read the clinical/technical metadata Excel file.
+
+Keep only rows where `MS FILE` matches a column in `expr_mat`.
+
+Order metadata rows so they are in the **same order** as the expression matrix columns → critical for correct alignment.
+
+```{r}
+meta <- read_excel(metadata_file)
+
+cat("meta dimensions:", paste(dim(meta), collapse = " x "), "\n")
+cat("Metadata columns:\n")
+print(colnames(meta)[1:10])
+
+# Keep only samples present in expression matrix
+meta_use <- meta %>%
+  filter(`MS FILE` %in% colnames(expr_mat)) %>%
+  arrange(match(`MS FILE`, colnames(expr_mat)))
+
+cat("meta_use dimensions:", paste(dim(meta_use), collapse = " x "), "\n")
+
+# Check alignment
+cat("Do meta_use$`MS FILE` and colnames(expr_mat) match order? ",
+    all(meta_use$`MS FILE` == colnames(expr_mat)), "\n")
+
+```
+
+## 6. Choose comparison: alive vs dead
+
+Select the column describing the **Alive vs Dead** comparison.
+
+Create a new `group` variable holding “Alive” / “Dead”.
+
+Drop samples with missing group labels. Now every remaining sample is clearly labelled as Alive or Dead.
+
+```{r}
+
+comp_col <- "Comparison 1 - alive vs dead"
+
+cat("Values in comparison column '", comp_col, "':\n", sep = "")
+print(table(meta_use[[comp_col]], useNA = "ifany"))
+
+# Build group variable and filter to non-missing groups
+meta_grouped <- meta_use %>%
+  mutate(group = .data[[comp_col]]) %>%
+  filter(!is.na(group) & group != "")
+
+cat("meta_grouped dimensions:", paste(dim(meta_grouped), collapse = " x "), "\n")
+cat("Group counts:\n")
+print(table(meta_grouped$group))
+
+# Subset expression matrix to these samples
+expr_mat_sub <- expr_mat[, meta_grouped$`MS FILE`, drop = FALSE]
+
+cat("expr_mat_sub dimensions:", paste(dim(expr_mat_sub), collapse = " x "), "\n")
+```
+
+## 7. Build SummarizedExperiment
+
+Subset `expr_mat` to include **only the Alive/Dead samples** (and in the same order as `meta_grouped`).
+
+Build a `coldata` data.frame with one row per sample and a `group` column.
+
+Make sure **column names of expression matrix = rownames of `colData`** (hard requirement for `SummarizedExperiment`).
+
+```{r}
+
+coldata <- meta_grouped %>%
+  dplyr::select(`MS FILE`, group) %>%       # keep only sample ID + group
+  dplyr::rename(sample = `MS FILE`) %>%     # rename 'MS FILE' -> 'sample'
+  as.data.frame()                           # convert tibble -> data.frame
+
+rownames(coldata) <- coldata$sample
+
+# Sanity check: now these should match
+stopifnot(identical(colnames(expr_mat_sub), rownames(coldata)))
+
+
+se <- SummarizedExperiment(
+  assays  = list(intensity = expr_mat_sub),
+  colData = coldata
+)
+
+se
+
+```
+
+## 8. Save SE object
+
+Combine the expression matrix and sample metadata into a **single Bioconductor object**.
+
+Save to disk so later scripts don’t need to re-import and clean everything.
+
+```{r}
+dir.create(
+  "C:\\Users\\tno\\Documents\\Coding\\Proteomics plasma analysis\\Data\\processed",
+  recursive = TRUE
+)
+saveRDS(se, "C:\\Users\\tno\\Documents\\Coding\\Proteomics plasma analysis\\Data\\processed\\proteomics_crc_alive_dead_se_raw.rds")
+
+```

@@ -1,0 +1,251 @@
+---
+title: "04 pathway enrichment"
+author: "Thomas Norburn"
+date: "2025-12-05"
+output: html_document
+---
+
+# 04_pathway_enrichment
+
+**Goal:**\
+
+Take the DE results, choose the most biologically interesting proteins, and identify **over-represented GO/KEGG pathways**.
+
+## Load libraries 
+
+```{r}
+library(tidyverse)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(ReactomePA)
+```
+
+## Paths
+
+```{r}
+results_tab_dir <- "C:\\Users\\tno\\Documents\\Coding\\Proteomics plasma analysis\\results\\tables"
+results_fig_dir <- "C:\\Users\\tno\\Documents\\Coding\\Proteomics plasma analysis\\results\\figures"
+
+de_file <- file.path(results_tab_dir, "DE_alive_vs_dead_proteins.csv")
+
+dir.create(results_tab_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(results_fig_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+## 1. Load DE results
+
+Use the differential expression table generated in Script 03 as the starting point.
+
+```{r}
+de <- read.csv(de_file, stringsAsFactors = FALSE)
+
+cat("DE table dimensions:", paste(dim(de), collapse = " x "), "\n")
+head(de)
+
+```
+
+## 2. Filter significant / top DE proteins
+
+Try to pick proteins that pass a relaxed FDR (adj.P.Val \< 0.10).
+
+If none pass (your case), fall back to the **top 50 proteins by raw p-value**.
+
+This is clearly **exploratory**, but valid for pathway discovery.
+
+```{r}
+p_cutoff  <- 0.10     # adj.P.Val < 0.10
+logFC_cut <- 0
+
+de_sig <- de %>%
+  filter(adj.P.Val < p_cutoff, abs(logFC) > logFC_cut)
+
+cat("Proteins with adj.P.Val <", p_cutoff, ":", nrow(de_sig), "\n")
+
+if (nrow(de_sig) == 0) {
+  message("No proteins pass adj.P.Val < ", p_cutoff,
+          ". Using top 50 proteins by raw p-value for exploratory enrichment.")
+  
+  de_sig <- de %>%
+    arrange(P.Value) %>%
+    slice(1:50)
+}
+
+cat("Proteins used for enrichment:", nrow(de_sig), "\n")
+```
+
+## 3. Extract primary UniProt accession
+
+Some entries contain multiple IDs separated by `;`. You take the **first UniProt ID** as the “primary” for mapping.
+
+```{r}
+
+# Accessions may look like "A0A096LPE2;P35542;Q09328"
+# Use the first ID as the 'primary' UniProt
+de_sig <- de_sig %>%
+  mutate(PrimaryAccession = sapply(strsplit(Accession, ";"), `[`, 1))
+
+length(unique(de_sig$PrimaryAccession))
+
+```
+
+## 4. Map UniProt -\> SYMBOL / ENTREZID
+
+Use the **human gene annotation database** to map UniProt proteins to gene symbols and Entrez IDs.
+
+Keep only those that successfully map → required for GO/KEGG.
+
+```{r}
+uni_keys <- unique(de_sig$PrimaryAccession)
+
+# Map via org.Hs.eg.db
+anno <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys    = uni_keys,
+  columns = c("SYMBOL", "ENTREZID"),
+  keytype = "UNIPROT"
+)
+
+head(anno)
+
+# Merge back into DE table
+de_sig_annot <- de_sig %>%
+  left_join(anno, by = c("PrimaryAccession" = "UNIPROT")) %>%
+  filter(!is.na(SYMBOL))   # keep only mapped genes
+
+cat("Mapped significant proteins to genes:", nrow(de_sig_annot), "\n")
+
+out_de_annot <- file.path(results_tab_dir, "DE_alive_vs_dead_proteins_annotated.csv")
+write.csv(de_sig_annot, out_de_annot, row.names = FALSE)
+cat("Saved annotated DE table to:\n  ", out_de_annot, "\n")
+
+```
+
+## 5. Prepare gene list for enrichment
+
+Create the gene sets for enrichment:
+
+1.  `gene_symbols` for GO
+
+2.  `entrez_ids` for KEGG
+
+```{r}
+gene_symbols <- unique(de_sig_annot$SYMBOL)
+entrez_ids   <- unique(de_sig_annot$ENTREZID)
+
+cat("Unique SYMBOLs:", length(gene_symbols), "\n")
+cat("Unique ENTREZIDs:", length(entrez_ids), "\n")
+
+```
+
+## 6. GO Biological Process enrichment
+
+Test whether any **GO Biological Process** terms contain **more of your DE genes than expected by chance**.
+
+Adjust for multiple testing (BH).
+
+Return a ranked list of enriched biological processes.
+
+```{r}
+ego_bp <- enrichGO(
+  gene          = gene_symbols,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.2,
+  readable      = TRUE
+)
+
+ego_bp_res <- as.data.frame(ego_bp)
+
+out_go_bp <- file.path(results_tab_dir, "GO_BP_enrichment_alive_vs_dead.csv")
+write.csv(ego_bp_res, out_go_bp, row.names = FALSE)
+cat("Saved GO BP enrichment to:\n  ", out_go_bp, "\n")
+
+# Dotplot of top GO BP terms
+if (nrow(ego_bp_res) > 0) {
+  p_go_bp <- dotplot(ego_bp, showCategory = 20) +
+    ggtitle("GO BP enrichment: DE proteins (Dead vs Alive)")
+  
+  go_bp_fig <- file.path(results_fig_dir, "GO_BP_enrichment_alive_vs_dead.png")
+  ggsave(go_bp_fig, p_go_bp, width = 7, height = 5, dpi = 300)
+  
+  cat("Saved GO BP dotplot to:\n  ", go_bp_fig, "\n")
+} else {
+  cat("No significant GO BP terms found.\n")
+}
+```
+
+## 7. Optional: KEGG pathway enrichment
+
+Same idea, but using curated KEGG pathways rather than GO BP terms:
+
+“Which pathways are over-represented among the genes associated with survival?”
+
+```{r}
+# KEGG generally prefers Entrez IDs
+if (length(entrez_ids) >= 5) {
+  ekegg <- enrichKEGG(
+    gene          = entrez_ids,
+    organism      = "hsa",
+    pAdjustMethod = "BH",
+    pvalueCutoff  = 0.05
+  )
+  
+  ekegg_res <- as.data.frame(ekegg)
+  out_kegg <- file.path(results_tab_dir, "KEGG_enrichment_alive_vs_dead.csv")
+  write.csv(ekegg_res, out_kegg, row.names = FALSE)
+  cat("Saved KEGG enrichment to:\n  ", out_kegg, "\n")
+  
+  if (nrow(ekegg_res) > 0) {
+    p_kegg <- dotplot(ekegg, showCategory = 20) +
+      ggtitle("KEGG enrichment: DE proteins (Dead vs Alive)")
+    
+    kegg_fig <- file.path(results_fig_dir, "KEGG_enrichment_alive_vs_dead.png")
+    ggsave(kegg_fig, p_kegg, width = 7, height = 5, dpi = 300)
+    
+    cat("Saved KEGG dotplot to:\n  ", kegg_fig, "\n")
+  } else {
+    cat("No significant KEGG pathways found.\n")
+  }
+} else {
+  cat("Not enough ENTREZ IDs for KEGG enrichment (need at least ~5).\n")
+}
+
+```
+
+## 8. Optional: Reactome pathway enrichment
+
+```{r}
+ if (length(entrez_ids) >= 5) {
+   er <- ReactomePA::enrichPathway(
+     gene          = entrez_ids,
+     organism      = "human",
+     pAdjustMethod = "BH",
+     pvalueCutoff  = 0.05,
+     readable      = TRUE
+   )
+
+   er_res <- as.data.frame(er)
+   out_reactome <- file.path(results_tab_dir, "Reactome_enrichment_alive_vs_dead.csv")
+   write.csv(er_res, out_reactome, row.names = FALSE)
+   cat("Saved Reactome enrichment to:\n  ", out_reactome, "\n")
+
+   if (nrow(er_res) > 0) {
+     p_reactome <- dotplot(er, showCategory = 20) +
+       ggtitle("Reactome enrichment: DE proteins (Dead vs Alive)")
+
+     reactome_fig <- file.path(results_fig_dir, "Reactome_enrichment_alive_vs_dead.png")
+     ggsave(reactome_fig, p_reactome, width = 7, height = 5, dpi = 300)
+
+     cat("Saved Reactome dotplot to:\n  ", reactome_fig, "\n")
+   } else {
+     cat("No significant Reactome pathways found.\n")
+   }
+ } else {
+   cat("Not enough ENTREZ IDs for Reactome enrichment.\n")
+ }
+
+```

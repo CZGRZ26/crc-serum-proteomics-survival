@@ -1,0 +1,266 @@
+---
+title: "02 normalisation imputation"
+author: "Thomas Norburn"
+date: "2025-12-05"
+output: html_document
+---
+
+# 02_normalisation_imputation
+
+**Goal:**\
+
+Take the raw `SummarizedExperiment`, transform, normalise, QC, and impute → ready for DE.
+
+## Load libraries 
+
+```{r}
+library(SummarizedExperiment)
+library(tidyverse)
+library(ggplot2)
+library(imputeLCMD)
+library(impute)
+```
+
+## 
+
+## Paths
+
+```{r}
+# Adjust if needed, but this matches what you used for saveRDS()
+in_file  <- "C:\\Users\\tno\\Documents\\Coding\\Proteomics plasma analysis\\Data\\processed\\proteomics_crc_alive_dead_se_raw.rds"
+out_file <- "C:\\Users\\tno\\Documents\\Coding\\Proteomics plasma analysis\\Data\\processed\\proteomics_crc_alive_dead_se_norm_imp.rds"
+
+results_fig_dir <- "C:\\Users\\tno\\Documents\\Coding\\Proteomics plasma analysis\\results\\figures"
+results_tab_dir <- "C:\\Users\\tno\\Documents\\Coding\\Proteomics plasma analysis\\results\\tables"
+
+dir.create(results_fig_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(results_tab_dir, recursive = TRUE, showWarnings = FALSE)
+
+```
+
+## 1. Load SE
+
+Load the object you built in Script 01 and extract the **raw intensity matrix**.
+
+```{r}
+se <- readRDS(in_file)
+se
+table(colData(se)$group)
+```
+
+## 2. Log2 transform
+
+Proteomics intensities are highly skewed; log2 makes them more **normal-like**, stabilises variance.
+
+`+1` avoids log2(0).
+
+We store this as a new assay `log2int`.
+
+```{r}
+raw_mat <- assay(se, "intensity")
+
+# add small offset to avoid log2(0)
+log2_mat <- log2(raw_mat + 1)
+
+assay(se, "log2int") <- log2_mat
+
+```
+
+## 3. QC: total log2 intensity per sample
+
+For each sample, sum all log2 intensities.
+
+Plot distributions by group.
+
+This helps you see if any samples are globally low/high (e.g. injection issues, technical outliers).
+
+```{r}
+
+qc_df <- data.frame(
+  sample      = colnames(log2_mat),
+  group       = colData(se)$group,
+  total_log2  = colSums(log2_mat, na.rm = TRUE)
+)
+
+p_tot <- ggplot(qc_df, aes(x = group, y = total_log2)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(
+    title = "Total log2 intensity per sample",
+    x = "Group",
+    y = "Sum log2(intensity + 1)"
+  )
+
+ggsave(
+  filename = file.path(results_fig_dir, "qc_total_log2_intensity_per_sample.png"),
+  plot     = p_tot,
+  width    = 5,
+  height   = 4,
+  dpi      = 300
+)
+
+```
+
+## 4. Check for missing values
+
+Compute, for each protein, the **proportion of missing values** across samples.
+
+Here, you require at least half the samples to have measurements (`< 0.5` missing).
+
+In your case, **no proteins failed this**, so all 224 were kept, but the logic is correct.
+
+```{r}
+
+miss_prop <- rowMeans(is.na(log2_mat))
+
+missing_df <- data.frame(
+  protein   = rownames(log2_mat),
+  miss_prop = miss_prop
+)
+
+write.csv(
+  missing_df,
+  file      = file.path(results_tab_dir, "missingness_per_protein.csv"),
+  row.names = FALSE
+)
+
+# keep proteins with <50% missing values overall
+keep <- miss_prop < 0.5
+se_filt <- se[keep, ]
+
+cat("Proteins before filter:", nrow(se), "\n")
+cat("Proteins after  filter:", nrow(se_filt), "\n")
+
+
+```
+
+## 5. Median normalisation (per sample)
+
+Compute median log2 intensity per sample.
+
+Subtract that median from all values in that sample (column).
+
+This centers each sample around 0 and removes **global intensity shifts** (e.g., different loading amounts or instrument drift).
+
+```{r}
+
+log2_filt <- assay(se_filt, "log2int")
+sample_medians <- apply(log2_filt, 2, median, na.rm = TRUE)
+
+# subtract sample median from each column (median-centering)
+log2_norm <- sweep(log2_filt, 2, sample_medians, FUN = "-")
+
+assay(se_filt, "log2norm") <- log2_norm
+
+```
+
+## 6. PCA before vs after normalisation
+
+Run PCA on samples (after transposing so samples = rows).
+
+Compare PCA plots **before vs after** normalisation.
+
+You’re checking that:
+
+-   Technical variation shrinks
+
+-   Biological signal (Alive vs Dead) is more interpretable.
+
+```{r}
+# PCA before normalisation
+pca_before <- prcomp(t(log2_filt), scale. = FALSE)
+
+pca_df_before <- data.frame(
+  PC1   = pca_before$x[, 1],
+  PC2   = pca_before$x[, 2],
+  group = colData(se_filt)$group
+)
+
+p_pca_before <- ggplot(pca_df_before, aes(PC1, PC2, color = group)) +
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(
+    title = "PCA (log2, filtered)",
+    x     = "PC1",
+    y     = "PC2"
+  )
+
+ggsave(
+  filename = file.path(results_fig_dir, "qc_pca_log2_filtered.png"),
+  plot     = p_pca_before,
+  width    = 5,
+  height   = 4,
+  dpi      = 300
+)
+
+# PCA after median normalisation
+pca_after <- prcomp(t(log2_norm), scale. = FALSE)
+
+pca_df_after <- data.frame(
+  PC1   = pca_after$x[, 1],
+  PC2   = pca_after$x[, 2],
+  group = colData(se_filt)$group
+)
+
+p_pca_after <- ggplot(pca_df_after, aes(PC1, PC2, color = group)) +
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(
+    title = "PCA (log2, median-normalised)",
+    x     = "PC1",
+    y     = "PC2"
+  )
+
+ggsave(
+  filename = file.path(results_fig_dir, "qc_pca_log2_median_norm.png"),
+  plot     = p_pca_after,
+  width    = 5,
+  height   = 4,
+  dpi      = 300
+)
+
+
+```
+
+## 7. Impute missing values
+
+Use **MinDet** imputation: assume missing values are **low-abundance (left-censored)** and fill them with small values inferred from the data distribution.
+
+This is standard for LC–MS proteomics.
+
+Store as `log2norm_imp` → this is the matrix you feed into limma.
+
+```{r}
+# work on the log2 median-normalised matrix
+norm_mat <- assay(se_filt, "log2norm")
+
+# MinDet imputation (left-censored / lower-than-detection assumption)
+imp_mat <- imputeLCMD::impute.MinDet(norm_mat)
+
+assay(se_filt, "log2norm_imp") <- imp_mat
+
+
+```
+
+## 8. Save processed SE
+
+Save the fully processed object with assays:
+
+1.  `intensity`
+
+2.  `log2int`
+
+3.  `log2norm`
+
+4.  `log2norm_imp`
+
+    so future scripts can jump straight into modelling.
+
+```{r}
+saveRDS(se_filt, out_file)
+
+cat("Saved processed SummarizedExperiment to:\n  ", out_file, "\n")
+cat("Assays available:\n")
+print(assayNames(se_filt))
+
+```

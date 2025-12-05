@@ -1,0 +1,197 @@
+---
+title: "03 differential expression"
+author: "Thomas Norburn"
+date: "2025-12-05"
+output: html_document
+---
+
+# 03_differential_expression
+
+**Goal:**\
+
+Use **limma** to test for differential protein abundance between **Dead vs Alive**, and visualise results.
+
+## Load libraries 
+
+```{r}
+library(SummarizedExperiment)
+library(tidyverse)
+library(limma)
+library(ggplot2)
+# Heatmap package (Bioconductor: BiocManager::install("ComplexHeatmap"))
+library(ComplexHeatmap)
+
+```
+
+## Paths
+
+```{r}
+in_file <- "C:\\Users\\tno\\Documents\\Coding\\Proteomics plasma analysis\\Data\\processed\\proteomics_crc_alive_dead_se_norm_imp.rds"
+
+results_fig_dir <- "C:\\Users\\tno\\Documents\\Coding\\Proteomics plasma analysis\\results\\figures"
+results_tab_dir <- "C:\\Users\\tno\\Documents\\Coding\\Proteomics plasma analysis\\results\\tables"
+
+dir.create(results_fig_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(results_tab_dir, recursive = TRUE, showWarnings = FALSE)
+
+```
+
+## 1. Load processed SE 
+
+Load the normalised, imputed data.
+
+Use `log2norm_imp` for stable, complete values.
+
+Extract the `group` variable (Alive vs Dead).
+
+```{r}
+se <- readRDS(in_file)
+se
+assayNames(se)
+table(colData(se)$group)
+
+# We'll use the imputed, log2-normalised matrix
+expr <- assay(se, "log2norm_imp")
+group <- factor(colData(se)$group)
+```
+
+## 2. Design matrix for limma
+
+Set **Alive** as the reference group.
+
+Build a design matrix so the model estimates the effect of being **Dead vs Alive**.
+
+The coefficient `"groupDead"` will represent **log2 fold change (Dead – Alive)**.
+
+```{r}
+# Make Alive the reference level (change if needed)
+group <- relevel(group, ref = "Alive")
+
+design <- model.matrix(~ group)
+colnames(design)
+
+# Typically you'll get: "(Intercept)" and "groupDead"
+coef_name <- colnames(design)[2]
+cat("Using coefficient:", coef_name, "\n")
+```
+
+## 3. Fit limma model
+
+Fit a linear model for each protein.
+
+Use limma’s **Empirical Bayes** to shrink variances and improve stability.
+
+Extract all proteins with logFC, p-values, and adj.P.Val.
+
+Save the full differential expression table so you can inspect, filter, and use it for enrichment.
+
+```{r}
+fit <- lmFit(expr, design)
+fit <- eBayes(fit)
+
+de_res <- topTable(fit, coef = coef_name, number = Inf) %>%
+  rownames_to_column("Accession")
+
+# Ensure adj.P.Val is present
+if (!"adj.P.Val" %in% colnames(de_res)) {
+  de_res$adj.P.Val <- p.adjust(de_res$P.Value, method = "BH")
+}
+
+# Save DE table
+out_de <- file.path(results_tab_dir, "DE_alive_vs_dead_proteins.csv")
+write.csv(de_res, out_de, row.names = FALSE)
+
+cat("Saved DE results to:\n  ", out_de, "\n")
+
+```
+
+## 4. Volcano plot
+
+Mark proteins that are both **statistically significant** (FDR) and have **reasonable fold change**.
+
+Volcano plot shows:
+
+1.  X-axis: effect size (logFC)
+
+2.  Y-axis: significance (–log10 p-value)
+
+Useful quick overview of differential abundance patterns.
+
+```{r}
+de_res <- de_res %>%
+  mutate(sig = adj.P.Val < 0.05 & abs(logFC) > 0.5)
+
+p_volcano <- ggplot(de_res, aes(x = logFC, y = -log10(P.Value))) +
+  geom_point(aes(color = sig), alpha = 0.7) +
+  scale_color_manual(values = c("FALSE" = "grey60", "TRUE" = "red")) +
+  theme_minimal() +
+  labs(
+    title = "Differential protein expression: Dead vs Alive",
+    x     = "log2 fold change (Dead vs Alive)",
+    y     = "-log10 p-value",
+    color = "Significant\n(adj.P.Val < 0.05,\n|logFC| > 0.5)"
+  )
+
+volcano_file <- file.path(results_fig_dir, "volcano_alive_vs_dead.png")
+ggsave(
+  filename = volcano_file,
+  plot     = p_volcano,
+  width    = 6,
+  height   = 5,
+  dpi      = 300
+)
+
+cat("Saved volcano plot to:\n  ", volcano_file, "\n")
+```
+
+## 5. Heatmap of top 50 DE proteins
+
+Select the 50 most “interesting” proteins (by FDR rank).
+
+Z-score per protein to view **relative up/down regulation** across samples.
+
+Cluster rows and columns, annotate by Alive/Dead → get a visual pattern of how these proteins separate the groups.
+
+```{r}
+# Take top 50 by adjusted p-value
+top50_ids <- de_res %>%
+  arrange(adj.P.Val) %>%
+  slice(1:50) %>%
+  pull(Accession)
+
+# Subset expression matrix
+mat_top50 <- expr[top50_ids, ]
+
+# z-score per protein (row-wise)
+mat_top50_z <- t(scale(t(mat_top50)))
+
+# Column annotation: group (Alive / Dead)
+annot_df <- data.frame(
+  group = group
+)
+rownames(annot_df) <- colnames(mat_top50_z)
+
+ha <- HeatmapAnnotation(
+  df = annot_df,
+  col = list(
+    group = c("Alive" = "skyblue", "Dead" = "tomato")
+  )
+)
+
+ht <- Heatmap(
+  mat_top50_z,
+  name          = "z-score",
+  top_annotation = ha,
+  show_row_names = FALSE,
+  column_title   = "Top 50 DE proteins (Dead vs Alive)",
+  clustering_method_rows = "complete",
+  clustering_method_columns = "complete"
+)
+
+heatmap_file <- file.path(results_fig_dir, "heatmap_top50_alive_vs_dead.png")
+png(heatmap_file, width = 900, height = 800, res = 120)
+draw(ht)
+dev.off()
+
+cat("Saved heatmap to:\n  ", heatmap_file, "\n")
+```
